@@ -1,0 +1,26 @@
+# ── Core ────────────────────────────────────────────────
+python-dotenv>=1.0.1
+httpx>=0.27.0
+numpy>=1.26.0
+
+# ── Audio I/O ───────────────────────────────────────────
+sounddevice>=0.4.7           # cross-platform mic/speaker access
+# On Windows: no extra install needed
+# On Mac:     brew install portaudio  (if missing)
+# On Linux:   sudo apt install portaudio19-dev python3-pyaudio
+
+# ── Speech-to-Text (local, free) ────────────────────────
+faster-whisper>=1.0.0        # runs Whisper locally via CTranslate2
+
+# ── Text-to-Speech (local, free) ────────────────────────
+edge-tts>=6.1.9              # Microsoft neural TTS, no API key needed
+
+# ── Wake Word Detection (local, free) ───────────────────
+openwakeword>=0.6.0          # "hey jarvis" model, downloads ~5 MB on first run
+onnxruntime>=1.17.0          # openwakeword inference backend
+
+# ── HUD overlay (futuristic floating UI) ────────────────
+PyQt6>=6.6.0                 # frameless glass overlay; no Qt install needed (wheels ship Qt)
+
+# ── Optional: premium TTS ───────────────────────────────
+# elevenlabs>=1.9.0          # set TTS_PROVIDER=elevenlabs + ELEVENLABS_API_KEY
