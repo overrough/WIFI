@@ -97,7 +97,8 @@ class JarvisHUD(QWidget):
         self._bar_timer.timeout.connect(self._randomise_bars)
         self._bar_timer.start(115)
 
-        self.show()
+        # Start hidden — HUD only appears when Jarvis is activated
+        self.hide()
 
     # ── Public thread-safe API ────────────────────────────────────────────────
 
@@ -116,14 +117,16 @@ class JarvisHUD(QWidget):
 
     def _apply_state(self, val: str):
         self._state = State(val)
-        self._fade_tgt = {
-            State.IDLE:      0.22,
-            State.LISTENING: 1.0,
-            State.THINKING:  1.0,
-            State.SPEAKING:  1.0,
-        }[self._state]
-        if self._state != State.SPEAKING:
-            pass    # keep text until explicitly cleared
+        if self._state == State.IDLE:
+            # Hide completely when idle — no black box sitting on desktop
+            self.hide()
+        else:
+            # Snap back to corner in case user moved it, then show
+            self._snap()
+            self._fade = 0.4        # start at 40% and animate up
+            self._fade_tgt = 1.0
+            self.show()
+            self.raise_()
 
     def _apply_text(self, text: str):
         self._text = text
@@ -394,6 +397,7 @@ if __name__ == "__main__":
     app = QApplication(sys.argv)
     app.setQuitOnLastWindowClosed(False)
     hud = JarvisHUD()
+    hud.show()          # show immediately for standalone test
     tray = setup_tray(app, hud)
 
     def _cycle():

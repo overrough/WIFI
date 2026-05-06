@@ -184,6 +184,11 @@ class WakeWordDetector:
         audio = np.concatenate(self._whisper_buffer)
         self._whisper_buffer.clear()
 
+        # Skip Whisper entirely if audio is just silence — avoids constant CPU drain
+        rms = float(np.sqrt(np.mean(audio ** 2)))
+        if rms < 0.02:
+            return False
+
         try:
             from stt_engine import transcribe_audio
             text = transcribe_audio(audio, sample_rate=SAMPLE_RATE, model_name="tiny")

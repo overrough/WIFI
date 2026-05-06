@@ -39,8 +39,11 @@ from typing import Optional
 
 import numpy as np
 from dotenv import load_dotenv
+from pathlib import Path
 
-load_dotenv()
+# Load backend .env so voice agent shares the same config
+_backend_env = Path(__file__).parent.parent / "backend" / ".env"
+load_dotenv(_backend_env)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -60,7 +63,7 @@ EDGE_TTS_VOICE = os.getenv("EDGE_TTS_VOICE", "en-US-GuyNeural")
 ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY", "")
 ELEVENLABS_VOICE_ID = os.getenv("ELEVENLABS_VOICE_ID", "")
 WAKE_WORD_SENSITIVITY = float(os.getenv("WAKE_WORD_SENSITIVITY", "0.5"))
-CLAP_RMS_THRESHOLD = float(os.getenv("CLAP_RMS_THRESHOLD", "0.15"))
+CLAP_RMS_THRESHOLD = float(os.getenv("CLAP_RMS_THRESHOLD", "0.45"))
 
 # Recording settings
 SAMPLE_RATE = 16000
@@ -362,14 +365,25 @@ def main() -> None:
     listener_thread.start()
 
     if qt_app is not None:
-        # Qt event loop owns the main thread
-        try:
-            exit_code = qt_app.exec()
-        except KeyboardInterrupt:
-            exit_code = 0
-        finally:
+        import signal
+        from PyQt6.QtCore import QTimer
+
+        def _quit(*_):
             listener.stop()
             loop.call_soon_threadsafe(loop.stop)
+            qt_app.quit()
+
+        # SIGINT (Ctrl+C) and SIGTERM (terminal closed) both quit cleanly
+        signal.signal(signal.SIGINT, _quit)
+        signal.signal(signal.SIGTERM, _quit)
+
+        # Qt blocks Python's signal handler while its event loop runs.
+        # A no-op timer every 300 ms gives Python a chance to check signals.
+        _sig_timer = QTimer()
+        _sig_timer.start(300)
+        _sig_timer.timeout.connect(lambda: None)
+
+        exit_code = qt_app.exec()
         sys.exit(exit_code)
     else:
         # Fallback: block main thread here
