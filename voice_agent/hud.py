@@ -12,6 +12,7 @@ Draggable: click-drag to reposition.
 System tray: right-click tray icon to quit.
 """
 
+import ctypes
 import math
 import random
 import sys
@@ -23,6 +24,28 @@ from PyQt6.QtGui import (
     QPixmap, QRadialGradient,
 )
 from PyQt6.QtWidgets import QApplication, QMenu, QSystemTrayIcon, QWidget
+
+# ── Windows click-through helper ─────────────────────────────────────────────
+_WS_EX_TRANSPARENT = 0x00000020
+_WS_EX_LAYERED     = 0x00080000
+_GWL_EXSTYLE       = -20
+
+
+def _set_click_through(hwnd: int, enable: bool) -> None:
+    """Toggle click-through (WS_EX_TRANSPARENT) on a Windows HWND."""
+    if sys.platform != "win32":
+        return
+    try:
+        user32 = ctypes.windll.user32
+        style = user32.GetWindowLongW(hwnd, _GWL_EXSTYLE)
+        if enable:
+            user32.SetWindowLongW(hwnd, _GWL_EXSTYLE,
+                                  style | _WS_EX_TRANSPARENT | _WS_EX_LAYERED)
+        else:
+            user32.SetWindowLongW(hwnd, _GWL_EXSTYLE,
+                                  style & ~_WS_EX_TRANSPARENT)
+    except Exception:
+        pass
 
 
 class State(Enum):
@@ -120,7 +143,13 @@ class JarvisHUD(QWidget):
         if self._state == State.IDLE:
             # Hide completely when idle — no black box sitting on desktop
             self.hide()
+            # Enable click-through so hidden window never blocks anything
+            if sys.platform == "win32" and self.winId():
+                _set_click_through(int(self.winId()), True)
         else:
+            # Disable click-through so user can drag during interaction
+            if sys.platform == "win32" and self.winId():
+                _set_click_through(int(self.winId()), False)
             # Snap back to corner in case user moved it, then show
             self._snap()
             self._fade = 0.4        # start at 40% and animate up

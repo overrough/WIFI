@@ -86,13 +86,24 @@ class JarvisAgent:
             + make_claude_tools()
         )
 
-    def _build_agent(self, user_id: str, system_prompt: str):
-        tools = self._build_tools(user_id)
+    def _build_agent(self, user_id: str, system_prompt: str, tools: Optional[list] = None):
+        """Build a LangGraph ReAct agent with the given system prompt.
+
+        `tools` may be passed explicitly to scope the agent to a sub-agent's
+        toolset. If None, the full registry is used.
+        """
+        if tools is None:
+            tools = self._build_tools(user_id)
         llm = self.provider.to_langchain_model()
+        # NOTE: LangGraph 0.2+ renamed `state_modifier` → `prompt`.
+        # Passing the wrong name raises TypeError and the entire stream
+        # silently returns empty, which surfaces as "I'm not sure how to
+        # respond" in the voice agent. This was the bug behind every
+        # failed command.
         return create_react_agent(
             model=llm,
             tools=tools,
-            state_modifier=system_prompt,
+            prompt=system_prompt,
         )
 
     async def _prepare_context(
@@ -146,11 +157,77 @@ class JarvisAgent:
         Streaming chat — yields text chunks as they arrive.
         Tool calls are executed silently; only the final text stream is yielded.
 
-        Flow:
-          1. Classify complexity (fast heuristic + optional LLM call)
-          2. If complex: generate execution plan (streamed as a "thinking" prefix)
-          3. Run ReAct agent with plan context
+        Multi-agent dance:
+          1. Orchestrator: classify the request into a lane
+             (research / write / execute / answer).
+          2. If a sub-agent owns the lane, build a SCOPED agent with
+             that sub-agent's role prompt + restricted toolset. This keeps
+             the LLM focused and stops the model from grabbing irrelevant
+             tools when the task is, say, just "draft a LinkedIn post".
+          3. If lane == "answer", fall through to a planning + ReAct loop
+             with the full toolset (existing behaviour).
         """
+        # ── Step 1: Orchestrator ────────────────────────────────────────────
+        from agents.orchestrator import classify_lane, get_sub_agent_role
+        lane = await classify_lane(query, self.provider)
+        logger.info("Orchestrator lane: %s for query=%r", lane, query[:80])
+
+        sub_role = get_sub_agent_role(lane) if lane in ("researcher", "writer", "executor") else None
+
+        # ── Step 2: Sub-agent path (focused role + scoped tools) ────────────
+        if sub_role is not None:
+            # Build memory context for the role
+            memory_context = await self.memory_manager.retrieve_for_context(query, user_id)
+            # Use the SAME system prompt structure as the main agent so the
+            # JARVIS personality is preserved, but layer the role's specific
+            # operating instructions on top.
+            base_prompt = build_system_prompt(
+                user_name=user_name,
+                mode=mode,
+                memory_context=memory_context,
+                available_tool_names=sub_role.tool_names,
+            )
+            system_prompt = (
+                base_prompt
+                + "\n\n─────────────────────────────────\n"
+                + f"ROLE FOR THIS TURN — {sub_role.name.upper()}:\n"
+                + sub_role.system_prompt
+                + "\n─────────────────────────────────"
+            )
+            # Filter the toolset down to just the role's allowed tools
+            all_tools = self._build_tools(user_id)
+            scoped_tools = [t for t in all_tools if t.name in sub_role.tool_names]
+            agent = self._build_agent(user_id, system_prompt, tools=scoped_tools)
+            messages = self._build_messages(history or [], query)
+
+            try:
+                async for event in agent.astream_events({"messages": messages}, version="v2"):
+                    kind = event.get("event")
+                    if kind == "on_chat_model_stream":
+                        chunk = event.get("data", {}).get("chunk")
+                        if chunk and hasattr(chunk, "content"):
+                            content = chunk.content
+                            if isinstance(content, str) and content:
+                                yield content
+                            elif isinstance(content, list):
+                                for block in content:
+                                    if isinstance(block, dict) and block.get("type") == "text":
+                                        text = block.get("text", "")
+                                        if text:
+                                            yield text
+                    elif kind == "on_tool_start":
+                        logger.info(
+                            "[%s] Tool: %s(%s)",
+                            sub_role.name,
+                            event.get("name", ""),
+                            str(event.get("data", {}).get("input", {}))[:120],
+                        )
+            except Exception as exc:
+                logger.error("Sub-agent %s stream error: %s", sub_role.name, exc, exc_info=True)
+                yield f"\n\n[{sub_role.name} error: {exc}]"
+            return
+
+        # ── Step 3: Default path (full agent + optional plan) ───────────────
         is_complex = await classify_complexity(query, self.provider)
 
         # Signal thinking start to UI

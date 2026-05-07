@@ -77,7 +77,7 @@ class MemoryManager:
 
     async def _get_profile_text(self, db: AsyncSession, user_id: str) -> str:
         result = await db.execute(
-            select(UserProfile).where(UserProfile.user_id == uuid.UUID(user_id))
+            select(UserProfile).where(UserProfile.user_id == user_id)
         )
         rows = result.scalars().all()
         if not rows:
@@ -91,7 +91,7 @@ class MemoryManager:
             try:
                 await db.execute(
                     update(Memory)
-                    .where(Memory.id == uuid.UUID(db_id))
+                    .where(Memory.id == db_id)
                     .values(
                         access_count=Memory.access_count + 1,
                         last_accessed_at=datetime.now(timezone.utc),
@@ -116,8 +116,8 @@ class MemoryManager:
 
         async with db_context() as db:
             mem = Memory(
-                id=uuid.UUID(memory_id),
-                user_id=uuid.UUID(user_id),
+                id=memory_id,
+                user_id=user_id,
                 type=memory_type,
                 content=content,
                 chroma_id=memory_id,
@@ -180,7 +180,7 @@ class MemoryManager:
         async with db_context() as db:
             result = await db.execute(
                 select(UserProfile).where(
-                    UserProfile.user_id == uuid.UUID(user_id),
+                    UserProfile.user_id == user_id,
                     UserProfile.key == key,
                 )
             )
@@ -190,7 +190,7 @@ class MemoryManager:
                 existing.source = source
             else:
                 db.add(UserProfile(
-                    user_id=uuid.UUID(user_id),
+                    user_id=user_id,
                     key=key,
                     value=value,
                     source=source,
@@ -208,7 +208,7 @@ class MemoryManager:
     async def get_user(self, user_id: str) -> Optional[User]:
         async with db_context() as db:
             result = await db.execute(
-                select(User).where(User.id == uuid.UUID(user_id))
+                select(User).where(User.id == user_id)
             )
             return result.scalar_one_or_none()
 

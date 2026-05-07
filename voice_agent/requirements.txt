@@ -22,5 +22,8 @@ onnxruntime>=1.17.0          # openwakeword inference backend
 # ── HUD overlay (futuristic floating UI) ────────────────
 PyQt6>=6.6.0                 # frameless glass overlay; no Qt install needed (wheels ship Qt)
 
+# ── Global hotkey (Ctrl+Shift+J) ────────────────────────
+keyboard>=0.13.5             # global hotkey capture; on Linux/Mac may need elevated perms
+
 # ── Optional: premium TTS ───────────────────────────────
 # elevenlabs>=1.9.0          # set TTS_PROVIDER=elevenlabs + ELEVENLABS_API_KEY

@@ -30,6 +30,7 @@ Then say "Jarvis" or double-clap to activate.
 """
 
 import asyncio
+import atexit
 import json
 import logging
 import os
@@ -59,7 +60,7 @@ API_KEY = os.getenv("JARVIS_API_KEY", "local-dev-key")
 DEFAULT_MODE = os.getenv("JARVIS_DEFAULT_MODE", "work")
 WHISPER_MODEL = os.getenv("WHISPER_MODEL", "base")
 TTS_PROVIDER = os.getenv("TTS_PROVIDER", "edge-tts")
-EDGE_TTS_VOICE = os.getenv("EDGE_TTS_VOICE", "en-US-GuyNeural")
+EDGE_TTS_VOICE = os.getenv("EDGE_TTS_VOICE", "en-GB-RyanNeural")
 ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY", "")
 ELEVENLABS_VOICE_ID = os.getenv("ELEVENLABS_VOICE_ID", "")
 WAKE_WORD_SENSITIVITY = float(os.getenv("WAKE_WORD_SENSITIVITY", "0.5"))
@@ -93,10 +94,16 @@ async def start_session() -> str:
 
 
 async def call_jarvis(conversation_id: str, user_message: str) -> str:
-    """Stream a message to the Jarvis backend and return the full response."""
+    """Stream a message to the Jarvis backend and return the full response.
+
+    Surfaces backend errors (type:"error" SSE events) instead of silently
+    swallowing them, so the user actually hears what went wrong instead of
+    the generic 'I'm not sure how to respond' fallback.
+    """
     import httpx
-    parts = []
-    async with httpx.AsyncClient(timeout=60) as client:
+    parts: list[str] = []
+    error_msg: str | None = None
+    async with httpx.AsyncClient(timeout=120) as client:
         async with client.stream(
             "POST",
             f"{BACKEND_URL}/chat/{conversation_id}/message",
@@ -108,13 +115,43 @@ async def call_jarvis(conversation_id: str, user_message: str) -> str:
                 if line.startswith("data: "):
                     try:
                         event = json.loads(line[6:])
-                        if event.get("type") == "token":
-                            parts.append(event.get("content", ""))
-                        elif event.get("type") == "done":
-                            break
                     except json.JSONDecodeError:
                         continue
+                    etype = event.get("type")
+                    if etype == "token":
+                        parts.append(event.get("content", ""))
+                    elif etype == "error":
+                        error_msg = event.get("content", "Unknown backend error.")
+                        logger.error("Backend stream error: %s", error_msg)
+                        break
+                    elif etype == "done":
+                        break
+    if error_msg and not parts:
+        # Surface the actual error in JARVIS voice so Sir can see what broke
+        return f"Sir, the backend reported a problem. {error_msg[:200]}"
     return "".join(parts)
+
+
+async def fetch_pending(force_brief: bool = False) -> dict:
+    """
+    Ask the backend if it has anything proactive to say:
+      - A morning/evening briefing (first activation of the day), OR
+      - Queued notifications from background routines.
+    Returns {} on failure so the caller can continue normally.
+    """
+    import httpx
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.get(
+                f"{BACKEND_URL}/jarvis/pending",
+                params={"force_brief": str(force_brief).lower()},
+                headers={"X-API-Key": API_KEY},
+            )
+            resp.raise_for_status()
+            return resp.json()
+    except Exception as exc:
+        logger.debug("fetch_pending failed: %s", exc)
+        return {}
 
 
 # ─── Audio recording ──────────────────────────────────────────────────────────
@@ -206,68 +243,163 @@ async def handle_activation(source: str) -> None:
         logger.debug("Ignoring activation — Jarvis is speaking.")
         return
 
-    # Show LISTENING state immediately
-    _hud_state("listening")
+    try:
+        # Show LISTENING state immediately
+        _hud_state("listening")
 
-    # Acknowledgement tone
-    await _ack()
+        # ── Proactive opener ────────────────────────────────────────────────
+        # Before asking "what?", check if JARVIS has something queued:
+        # a morning briefing, an overdue task nudge, a meeting reminder, etc.
+        proactive = await fetch_pending()
+        opener_text = proactive.get("briefing")
+        if not opener_text:
+            queued = proactive.get("notifications") or []
+            if queued:
+                # Speak top 1-2 notifications back-to-back
+                opener_text = " ".join(n["content"] for n in queued[:2])
 
-    # Record — feed live RMS to HUD waveform
-    def on_chunk(rms: float):
-        if _hud:
+        if opener_text:
+            logger.info("Proactive opener: %s", opener_text[:100])
+            print(f"\nJarvis: {opener_text}\n")
+            _hud_state("speaking", opener_text)
+            _is_speaking = True
             try:
-                _hud.set_audio_level(min(rms / 0.18, 1.0))
-            except Exception:
-                pass
+                from tts_engine import speak
+                await speak(
+                    opener_text,
+                    provider=TTS_PROVIDER,
+                    voice=EDGE_TTS_VOICE,
+                    elevenlabs_api_key=ELEVENLABS_API_KEY,
+                    elevenlabs_voice_id=ELEVENLABS_VOICE_ID,
+                )
+            finally:
+                _is_speaking = False
+            _hud_state("listening")
+        else:
+            # Standard short acknowledgement
+            await _ack()
 
-    loop = asyncio.get_event_loop()
-    audio = await loop.run_in_executor(
-        None, lambda: record_until_silence(on_chunk=on_chunk)
-    )
+        # Record — feed live RMS to HUD waveform
+        def on_chunk(rms: float):
+            if _hud:
+                try:
+                    _hud.set_audio_level(min(rms / 0.18, 1.0))
+                except Exception:
+                    pass
 
-    if audio.size == 0:
-        logger.info("No speech detected — staying idle.")
+        loop = asyncio.get_event_loop()
+        audio = await loop.run_in_executor(
+            None, lambda: record_until_silence(on_chunk=on_chunk)
+        )
+
+        if audio.size == 0:
+            logger.info("No speech detected — staying idle.")
+            return
+
+        # STT
+        from stt_engine import transcribe_audio
+        text = await loop.run_in_executor(
+            None, transcribe_audio, audio, SAMPLE_RATE, WHISPER_MODEL
+        )
+
+        if not text.strip():
+            logger.info("Nothing understood — staying idle.")
+            return
+
+        logger.info("You said: %r", text)
+        print(f"\nYou: {text}")
+
+        # Thinking state while processing
+        _hud_state("thinking")
+
+        # Try local command router first
+        from command_router import route_command
+        cmd_result = route_command(text)
+
+        if cmd_result.handled:
+            response = cmd_result.response
+            logger.info("Local command: %r → %r", text, response)
+            print(f"Jarvis: {response}\n")
+        else:
+            # Fall through to Jarvis backend
+            try:
+                if _conversation_id is None:
+                    _conversation_id = await start_session()
+
+                response = await call_jarvis(_conversation_id, text)
+                if not response:
+                    response = "I'm not sure how to respond to that."
+            except Exception as exc:
+                logger.error("Backend error: %s", exc)
+                response = "Sorry, the backend is unavailable right now."
+                _conversation_id = None
+
+            logger.info("Jarvis: %r", response)
+            print(f"Jarvis: {response}\n")
+
+        # Speaking state with response text visible on HUD
+        _hud_state("speaking", response)
+        _is_speaking = True
+        try:
+            from tts_engine import speak
+            await speak(
+                response,
+                provider=TTS_PROVIDER,
+                voice=EDGE_TTS_VOICE,
+                elevenlabs_api_key=ELEVENLABS_API_KEY,
+                elevenlabs_voice_id=ELEVENLABS_VOICE_ID,
+            )
+        finally:
+            _is_speaking = False
+
+    except Exception as exc:
+        logger.error("Activation handler error: %s", exc, exc_info=True)
+    finally:
         _hud_state("idle")
+
+
+async def _handle_typed_command(text: str) -> None:
+    """Process a command typed in the text-input fallback.
+
+    Same pipeline as a voice command, but skips STT entirely.
+    """
+    global _conversation_id, _is_speaking
+    if _is_speaking:
+        logger.debug("Ignoring typed command — Jarvis is speaking.")
         return
 
-    # STT
-    from stt_engine import transcribe_audio
-    text = await loop.run_in_executor(
-        None, transcribe_audio, audio, SAMPLE_RATE, WHISPER_MODEL
-    )
-
-    if not text.strip():
-        logger.info("Nothing understood — staying idle.")
-        _hud_state("idle")
+    text = (text or "").strip()
+    if not text:
         return
 
-    logger.info("You said: %r", text)
-    print(f"\nYou: {text}")
+    logger.info("You typed: %r", text)
+    print(f"\nYou (typed): {text}")
 
-    # Thinking state while processing
     _hud_state("thinking")
 
     # Try local command router first
-    from command_router import route_command
-    cmd_result = route_command(text)
+    try:
+        from command_router import route_command
+        cmd_result = route_command(text)
+    except Exception as exc:
+        logger.error("Local command routing error: %s", exc)
+        cmd_result = None
 
-    if cmd_result.handled:
+    if cmd_result is not None and cmd_result.handled:
         response = cmd_result.response
-        logger.info("Local command: %r → %r", text, response)
-        print(f"Jarvis: {response}\n")
     else:
-        # Fall through to Jarvis backend
-        if _conversation_id is None:
-            _conversation_id = await start_session()
+        try:
+            if _conversation_id is None:
+                _conversation_id = await start_session()
+            response = await call_jarvis(_conversation_id, text)
+            if not response:
+                response = "I'm not sure how to respond to that."
+        except Exception as exc:
+            logger.error("Backend error: %s", exc)
+            response = "Sorry, the backend is unavailable right now."
+            _conversation_id = None
 
-        response = await call_jarvis(_conversation_id, text)
-        if not response:
-            response = "I'm not sure how to respond to that."
-
-        logger.info("Jarvis: %r", response)
-        print(f"Jarvis: {response}\n")
-
-    # Speaking state with response text visible on HUD
+    print(f"Jarvis: {response}\n")
     _hud_state("speaking", response)
     _is_speaking = True
     try:
@@ -284,15 +416,68 @@ async def handle_activation(source: str) -> None:
         _hud_state("idle")
 
 
+_ACK_BEEP_HZ = 1320            # short pleasant chime
+_ACK_BEEP_MS = 90
+_VERBAL_ACK = os.getenv("JARVIS_VERBAL_ACK", "false").lower() == "true"
+
+
 async def _ack() -> None:
-    """Short acknowledgement to confirm activation."""
+    """Activation acknowledgement.
+
+    Default: a tiny beep. Set JARVIS_VERBAL_ACK=true in .env if Sir
+    actually wants the spoken "Sir?" / "Listening, Sir." each time —
+    most of the time the beep is faster and far less annoying.
+    """
+    if _VERBAL_ACK:
+        try:
+            from tts_engine import speak
+            await speak("Sir.", provider=TTS_PROVIDER, voice=EDGE_TTS_VOICE,
+                        elevenlabs_api_key=ELEVENLABS_API_KEY,
+                        elevenlabs_voice_id=ELEVENLABS_VOICE_ID)
+            return
+        except Exception as exc:
+            logger.debug("Verbal ack failed (%s) — falling back to beep.", exc)
+
+    # Beep — instantaneous, never overlaps with TTS, gives clear feedback.
     try:
-        from tts_engine import speak
-        await speak("Sir?", provider=TTS_PROVIDER, voice=EDGE_TTS_VOICE,
-                    elevenlabs_api_key=ELEVENLABS_API_KEY,
-                    elevenlabs_voice_id=ELEVENLABS_VOICE_ID)
+        if sys.platform == "win32":
+            import winsound
+            winsound.Beep(_ACK_BEEP_HZ, _ACK_BEEP_MS)
     except Exception as exc:
-        logger.debug("Ack failed: %s", exc)
+        logger.debug("Ack beep failed: %s", exc)
+
+
+# ─── Single-instance guard ────────────────────────────────────────────────────
+
+def _ensure_single_instance() -> bool:
+    """Prevent two JARVIS voices running at once.
+
+    Uses a Windows named mutex (cross-process). Returns True if we're the
+    only instance; False if another JARVIS is already running — in which
+    case the caller should exit cleanly so we don't speak in stereo.
+    """
+    if sys.platform != "win32":
+        return True
+    try:
+        import ctypes
+        ERROR_ALREADY_EXISTS = 183
+        kernel32 = ctypes.windll.kernel32
+        # The handle is intentionally leaked — it's released only when
+        # this Python process exits, which is exactly what we want.
+        handle = kernel32.CreateMutexW(None, False, "Global\\JARVIS_VoiceAgent_Singleton")
+        last_error = ctypes.GetLastError()
+        if last_error == ERROR_ALREADY_EXISTS:
+            return False
+        # Keep handle alive for the lifetime of the process
+        global _MUTEX_HANDLE
+        _MUTEX_HANDLE = handle
+        return True
+    except Exception as exc:
+        logger.debug("Single-instance check failed (%s) — proceeding anyway.", exc)
+        return True
+
+
+_MUTEX_HANDLE = None  # populated by _ensure_single_instance() to keep it alive
 
 
 # ─── Entry point ──────────────────────────────────────────────────────────────
@@ -306,10 +491,18 @@ def _run_asyncio_loop(loop: asyncio.AbstractEventLoop) -> None:
 def main() -> None:
     global _hud
 
+    # ── Single-instance guard ───────────────────────────────────────────────
+    # If another JARVIS is already running, exit silently instead of
+    # speaking in stereo. Solves the "two Jarvises talking at once" issue.
+    if not _ensure_single_instance():
+        print("JARVIS is already running — closing this duplicate.")
+        return
+
     from wake_word import ActivationListener
 
     # ── Try to start PyQt6 HUD ────────────────────────────────────────────────
     qt_app = None
+    text_input = None
     try:
         from PyQt6.QtWidgets import QApplication
         from hud import JarvisHUD, setup_tray
@@ -328,6 +521,22 @@ def main() -> None:
 
     # ── Asyncio loop (background thread) ─────────────────────────────────────
     loop = asyncio.new_event_loop()
+
+    # ── Text-input fallback ─────────────────────────────────────────────────
+    # Built AFTER `loop` exists so the on_submit callback can post coroutines
+    # to it. Triggered globally by Ctrl+Shift+T (registered further below).
+    if qt_app is not None:
+        try:
+            from text_input import TextInput
+            text_input = TextInput(
+                on_submit=lambda s: asyncio.run_coroutine_threadsafe(
+                    _handle_typed_command(s), loop
+                ),
+                hud=_hud,
+            )
+            logger.info("Text-input fallback ready (Ctrl+Shift+T).")
+        except Exception as exc:
+            logger.debug("Text-input fallback unavailable: %s", exc)
 
     def on_activate(source: str) -> None:
         asyncio.run_coroutine_threadsafe(handle_activation(source), loop)
@@ -355,6 +564,23 @@ def main() -> None:
         rms_threshold=CLAP_RMS_THRESHOLD,
     )
 
+    # ── Optional global hotkeys: Ctrl+Shift+J (voice), Ctrl+Shift+T (text) ──
+    hotkey = None
+    try:
+        from hotkey import HotkeyListener
+        hotkey = HotkeyListener(on_activate=on_activate)
+    except Exception as exc:
+        logger.debug("Hotkey listener unavailable: %s", exc)
+
+    # Ctrl+Shift+T → summon the text-input box. Best-effort.
+    if text_input is not None:
+        try:
+            import keyboard  # type: ignore
+            keyboard.add_hotkey("ctrl+shift+t", text_input.request_show)
+            logger.info("Registered text-input hotkey: Ctrl+Shift+T")
+        except Exception as exc:
+            logger.debug("Could not register Ctrl+Shift+T (%s)", exc)
+
     # Asyncio runs in a background thread; Qt (or blocking) takes the main thread
     asyncio_thread = threading.Thread(
         target=_run_asyncio_loop, args=(loop,), daemon=True
@@ -364,18 +590,50 @@ def main() -> None:
     listener_thread = threading.Thread(target=listener.start, daemon=True)
     listener_thread.start()
 
+    if hotkey is not None:
+        hotkey.start()  # non-blocking — hooks into the global event loop
+
+    # ── Cleanup function used by all exit paths ─────────────────────────────
+    def _cleanup(*_):
+        listener.stop()
+        if hotkey is not None:
+            try:
+                hotkey.stop()
+            except Exception:
+                pass
+        loop.call_soon_threadsafe(loop.stop)
+        if qt_app is not None:
+            qt_app.quit()
+
+    # atexit — catches normal interpreter shutdown AND Windows console close
+    atexit.register(_cleanup)
+
+    # Windows console close handler (X button, logoff, shutdown)
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            _CTRL_C_EVENT = 0
+            _CTRL_CLOSE_EVENT = 2
+            _kernel32 = ctypes.windll.kernel32
+
+            @ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_uint)
+            def _console_handler(event):
+                if event in (_CTRL_C_EVENT, _CTRL_CLOSE_EVENT):
+                    _cleanup()
+                    return True
+                return False
+
+            _kernel32.SetConsoleCtrlHandler(_console_handler, True)
+        except Exception as exc:
+            logger.debug("Could not set Windows console handler: %s", exc)
+
     if qt_app is not None:
         import signal
         from PyQt6.QtCore import QTimer
 
-        def _quit(*_):
-            listener.stop()
-            loop.call_soon_threadsafe(loop.stop)
-            qt_app.quit()
-
-        # SIGINT (Ctrl+C) and SIGTERM (terminal closed) both quit cleanly
-        signal.signal(signal.SIGINT, _quit)
-        signal.signal(signal.SIGTERM, _quit)
+        # SIGINT (Ctrl+C) and SIGTERM both quit cleanly
+        signal.signal(signal.SIGINT, _cleanup)
+        signal.signal(signal.SIGTERM, _cleanup)
 
         # Qt blocks Python's signal handler while its event loop runs.
         # A no-op timer every 300 ms gives Python a chance to check signals.
@@ -391,8 +649,7 @@ def main() -> None:
             asyncio_thread.join()
         except KeyboardInterrupt:
             print("\nShutting down JARVIS...")
-            listener.stop()
-            loop.call_soon_threadsafe(loop.stop)
+            _cleanup()
 
 
 if __name__ == "__main__":

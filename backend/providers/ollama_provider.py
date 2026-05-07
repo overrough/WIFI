@@ -8,7 +8,11 @@ import logging
 from typing import Any, AsyncGenerator, Optional
 
 import httpx
-from langchain_community.chat_models import ChatOllama
+# Use the new langchain-ollama package — the langchain_community ChatOllama
+# is deprecated AND missing bind_tools(), which LangGraph 1.x's
+# create_react_agent requires. Without this, every agent call raises
+# NotImplementedError and the voice agent silently falls back.
+from langchain_ollama import ChatOllama
 
 from providers.base import Message, ModelProvider, ModelResponse, Tool, ToolCall
 

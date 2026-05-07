@@ -54,7 +54,10 @@ class Settings(BaseSettings):
     whisper_model: str = "base"
     # TTS: edge-tts is free (MS neural). elevenlabs needs a key for premium voices.
     tts_provider: Literal["edge-tts", "elevenlabs"] = "edge-tts"
-    edge_tts_voice: str = "en-US-GuyNeural"
+    # JARVIS = British male butler. Default to a confident neural British voice.
+    # Alternatives: en-GB-ThomasNeural (warmer), en-GB-SoniaNeural (female),
+    # en-AU-WilliamNeural (Australian male). Override in .env if desired.
+    edge_tts_voice: str = "en-GB-RyanNeural"
     elevenlabs_api_key: str = ""
     elevenlabs_voice_id: str = ""
     # Wake word sensitivity 0.0–1.0 (lower = more sensitive, more false positives)

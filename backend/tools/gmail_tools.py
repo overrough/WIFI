@@ -113,15 +113,30 @@ def make_gmail_tools():
         )
 
     @tool
-    def send_email(to: str, subject: str, body: str) -> str:
+    def send_email(to: str, subject: str, body: str, confirm: bool = False) -> str:
         """
         Send an email immediately via Gmail.
+
+        SAFETY: This is an irreversible external action. By default this tool
+        returns a confirmation prompt and does NOT send. Only call with
+        confirm=True AFTER Sir has explicitly approved sending in conversation.
+
         Args:
             to: Recipient email address.
             subject: Email subject line.
             body: Plain-text email body.
-        Returns confirmation of send.
+            confirm: Must be True to actually send. Defaults to False (dry-run).
         """
+        from jarvis_core.safety import confirmation_prompt
+
+        if not confirm:
+            preview = body if len(body) <= 200 else body[:200] + "…"
+            return confirmation_prompt(
+                action="send an email to",
+                target=to,
+                details=f"Subject: {subject}\nBody: {preview}",
+            )
+
         try:
             service = _get_gmail_service()
         except RuntimeError as e:
@@ -185,14 +200,20 @@ def make_gmail_tools():
         return "\n".join(lines)
 
     @tool
-    def reply_email(message_id: str, body: str) -> str:
+    def reply_email(message_id: str, body: str, confirm: bool = False) -> str:
         """
         Reply to an existing email thread.
+
+        SAFETY: Irreversible external action. Default is dry-run preview.
+        Only call with confirm=True after Sir explicitly approves.
+
         Args:
             message_id: The Gmail message ID to reply to (from list_emails).
             body: Plain-text reply body.
-        Returns confirmation.
+            confirm: Must be True to actually send. Defaults to False (dry-run).
         """
+        from jarvis_core.safety import confirmation_prompt
+
         try:
             service = _get_gmail_service()
         except RuntimeError as e:
@@ -212,6 +233,14 @@ def make_gmail_tools():
         if not subject.lower().startswith("re:"):
             subject = "Re: " + subject
         to = headers.get("From", "")
+
+        if not confirm:
+            preview = body if len(body) <= 200 else body[:200] + "…"
+            return confirmation_prompt(
+                action="send a reply to",
+                target=to,
+                details=f"Subject: {subject}\nBody: {preview}",
+            )
 
         msg = MIMEText(body, "plain")
         msg["to"] = to

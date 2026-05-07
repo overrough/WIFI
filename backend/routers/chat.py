@@ -92,7 +92,7 @@ async def send_message(
     # Verify conversation belongs to this user
     result = await db.execute(
         select(Conversation).where(
-            Conversation.id == uuid.UUID(conversation_id),
+            Conversation.id == conversation_id,
             Conversation.user_id == user.id,
         )
     )
@@ -170,7 +170,7 @@ async def end_conversation(
     """
     result = await db.execute(
         select(Conversation).where(
-            Conversation.id == uuid.UUID(conversation_id),
+            Conversation.id == conversation_id,
             Conversation.user_id == user.id,
         )
     )
@@ -232,7 +232,7 @@ async def get_messages(
 ):
     result = await db.execute(
         select(Conversation).where(
-            Conversation.id == uuid.UUID(conversation_id),
+            Conversation.id == conversation_id,
             Conversation.user_id == user.id,
         )
     )

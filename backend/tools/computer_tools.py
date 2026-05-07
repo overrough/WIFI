@@ -196,6 +196,7 @@ def make_computer_tools():
         command: str,
         working_directory: str = ".",
         timeout: int = 30,
+        confirm: bool = False,
     ) -> str:
         """
         Execute a shell command and return its output.
@@ -203,14 +204,30 @@ def make_computer_tools():
         timeout: max seconds (default 30, max 120).
         The command runs in the specified working directory (default: home).
 
+        SAFETY: For destructive commands (rm, del, format, drop table,
+        git --force, etc.) you MUST first call without confirm=True to
+        get a preview, then ask Sir for explicit approval, then call again
+        with confirm=True. Read commands (ls, git status, cat, dir) execute
+        immediately without confirmation.
+
         Examples:
           execute_command("git status")
           execute_command("python script.py", working_directory="~/projects/myapp")
           execute_command("npm install", working_directory="frontend")
         """
+        from jarvis_core.safety import confirmation_prompt, is_destructive_shell
+
         safe, reason = _is_safe_shell(command)
         if not safe:
             return f"Command blocked: {reason}"
+
+        # Destructive commands need explicit confirmation
+        if is_destructive_shell(command) and not confirm:
+            return confirmation_prompt(
+                action="run a destructive shell command",
+                target=command,
+                details=f"Working directory: {working_directory}",
+            )
 
         timeout = min(int(timeout), 120)
         cwd = (WORKSPACE / working_directory).resolve()

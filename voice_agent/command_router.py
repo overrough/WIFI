@@ -16,6 +16,7 @@ Supported command categories:
   5. QUICK ACTIONS — "what time is it", "take a screenshot"
 """
 
+import difflib
 import logging
 import os
 import platform
@@ -26,6 +27,76 @@ from dataclasses import dataclass
 from typing import Callable, Optional
 
 logger = logging.getLogger(__name__)
+
+# ── Safety: dry-run wrapper ──────────────────────────────────────────────────
+#
+# Set env var JARVIS_DRY_RUN=1 to block *all* shell/app executions in this
+# module — route_command() will still return the correct CommandResult but
+# no actual subprocess will spawn. Used for:
+#   • Automated tests / verification scripts (so e.g. "restart" does NOT
+#     actually reboot the machine, which happened once — a real incident
+#     that proved why we need this gate).
+#   • "Preview what JARVIS would do" mode in future UI.
+#
+# Separately, every destructive command is AUDIT-LOGGED to
+#   backend/data/command_audit.log
+# with a timestamp so there's always a paper trail of what ran and when.
+
+_DRY_RUN = os.getenv("JARVIS_DRY_RUN", "").lower() in ("1", "true", "yes")
+
+# Commands we consider "destructive" — logged with a louder WARNING level.
+_DESTRUCTIVE_PATTERNS = (
+    "shutdown", "powrprof", "Clear-RecycleBin",
+    "LockWorkStation", "SetSuspendState",
+)
+
+
+class _NullProc:
+    """Stand-in for a subprocess.Popen handle when dry-running."""
+    returncode = 0
+    def wait(self, *a, **kw): return 0
+    def poll(self): return 0
+    def terminate(self): pass
+    def kill(self): pass
+    def communicate(self, *a, **kw): return (b"", b"")
+
+
+def _audit_log(cmd_repr: str, destructive: bool) -> None:
+    """Append every spawned command to an audit log on disk."""
+    try:
+        from datetime import datetime
+        from pathlib import Path
+        audit_dir = Path(__file__).resolve().parent.parent / "backend" / "data"
+        audit_dir.mkdir(parents=True, exist_ok=True)
+        tag = "DESTRUCTIVE" if destructive else "normal"
+        dry = " [DRY-RUN]" if _DRY_RUN else ""
+        line = f"{datetime.now().isoformat(timespec='seconds')} {tag}{dry} {cmd_repr}\n"
+        with open(audit_dir / "command_audit.log", "a", encoding="utf-8") as f:
+            f.write(line)
+    except Exception:
+        pass  # audit failures must never break the actual command
+
+
+def _safe_popen(*args, **kwargs):
+    """subprocess.Popen wrapper that respects JARVIS_DRY_RUN and audit-logs.
+
+    Use this instead of subprocess.Popen throughout command_router. It's
+    the single choke-point where destructive OS commands become observable
+    and, when necessary, blockable.
+    """
+    cmd_repr = args[0] if args else kwargs.get("args", "")
+    cmd_str = str(cmd_repr)
+    destructive = any(pat.lower() in cmd_str.lower() for pat in _DESTRUCTIVE_PATTERNS)
+
+    if destructive:
+        logger.warning("Destructive command requested: %r (dry_run=%s)", cmd_str, _DRY_RUN)
+    _audit_log(cmd_str, destructive)
+
+    if _DRY_RUN:
+        logger.info("[DRY-RUN] skipped: %r", cmd_str)
+        return _NullProc()
+
+    return _safe_popen(*args, **kwargs)
 
 
 @dataclass
@@ -78,6 +149,15 @@ APPS = {
     "calculator": "start calc",
     "paint": "start mspaint",
     "snipping tool": "start snippingtool",
+    "camera": "start microsoft.windows.camera:",
+    "webcam": "start microsoft.windows.camera:",
+    "photos": "start ms-photos:",
+    "store": "start ms-windows-store:",
+    "maps": "start bingmaps:",
+    "clock": "start ms-clock:",
+    "alarms": "start ms-clock:",
+    "weather": "start bingweather:",
+    "mail": "start outlookmail:",
 
     # Media
     "spotify": "start spotify",
@@ -87,6 +167,35 @@ APPS = {
     "claude": "__CLAUDE__",     # special handler
     "claude desktop": "__CLAUDE__",
     "cursor": "start cursor",
+    "chatgpt": "start https://chatgpt.com",
+    "chat gpt": "start https://chatgpt.com",
+
+    # Voice / dictation
+    "wispr flow": "__WISPR_FLOW__",
+    "whisper flow": "__WISPR_FLOW__",
+    "vs perflow": "__WISPR_FLOW__",   # common Whisper mishearing
+
+    # Adobe & creative
+    "photoshop": "start photoshop",
+    "premiere pro": "start premiere",
+    "after effects": "start afterfx",
+    "figma": "start figma",
+    "canva": "start https://canva.com",
+    "notion": "start notion",
+    "obs": "start obs64",
+
+    # Special: Recycle Bin (no path → use shell namespace)
+    "recycle bin": "__RECYCLE_BIN__",
+    "recyclebin": "__RECYCLE_BIN__",
+    "trash": "__RECYCLE_BIN__",
+    "bin": "__RECYCLE_BIN__",
+
+    # Office variants
+    "wordpad": "start write",
+    "word pad": "start write",
+    "microsoft word": "start winword",
+    "microsoft excel": "start excel",
+    "microsoft powerpoint": "start powerpnt",
 }
 
 
@@ -139,17 +248,52 @@ def _normalize(text: str) -> str:
     return text.strip()
 
 
+def _fuzzy_match(name: str, registry: dict, threshold: float = 0.7) -> str | None:
+    """Find the closest key in a registry using fuzzy matching."""
+    if name in registry:
+        return name
+    matches = difflib.get_close_matches(name, registry.keys(), n=1, cutoff=threshold)
+    if matches:
+        logger.info("Fuzzy matched %r → %r", name, matches[0])
+        return matches[0]
+    return None
+
+
 def _open_app(app_name: str) -> CommandResult:
     """Launch an application."""
-    cmd = APPS.get(app_name)
+    matched = _fuzzy_match(app_name, APPS)
+    cmd = APPS.get(matched) if matched else None
     if not cmd:
         return CommandResult(handled=False, response="")
 
     if cmd == "__CLAUDE__":
         return _open_claude_desktop()
 
+    if cmd == "__WISPR_FLOW__":
+        # Wispr Flow installs to %LOCALAPPDATA%\Programs\WisprFlow\Wispr Flow.exe
+        for path in [
+            os.path.expandvars(r"%LOCALAPPDATA%\Programs\WisprFlow\Wispr Flow.exe"),
+            os.path.expandvars(r"%LOCALAPPDATA%\WisprFlow\Wispr Flow.exe"),
+            os.path.expandvars(r"%PROGRAMFILES%\WisprFlow\Wispr Flow.exe"),
+        ]:
+            if os.path.exists(path):
+                _safe_popen([path], shell=False)
+                return CommandResult(handled=True, response="Opening Wispr Flow.")
+        # Fallback: try start menu shortcut by name
+        try:
+            _safe_popen('start "" "Wispr Flow"', shell=True)
+            return CommandResult(handled=True, response="Opening Wispr Flow.")
+        except Exception:
+            return CommandResult(handled=True, success=False,
+                                 response="I can't find Wispr Flow on this system, Sir.")
+
+    if cmd == "__RECYCLE_BIN__":
+        # Open the Recycle Bin via the shell namespace GUID
+        _safe_popen('explorer.exe shell:RecycleBinFolder', shell=True)
+        return CommandResult(handled=True, response="Opening the Recycle Bin.")
+
     try:
-        subprocess.Popen(cmd, shell=True)
+        _safe_popen(cmd, shell=True)
         pretty = app_name.title()
         logger.info("Launched app: %s (cmd=%s)", pretty, cmd)
         return CommandResult(handled=True, response=f"Opening {pretty}.")
@@ -164,7 +308,8 @@ def _open_app(app_name: str) -> CommandResult:
 
 def _open_website(site_name: str) -> CommandResult:
     """Open a website in the default browser."""
-    url = WEBSITES.get(site_name)
+    matched = _fuzzy_match(site_name, WEBSITES)
+    url = WEBSITES.get(matched) if matched else None
     if not url:
         # Check if it looks like a URL
         if "." in site_name and " " not in site_name:
@@ -214,7 +359,7 @@ def _open_claude_desktop(prompt: str = "") -> CommandResult:
                     os.path.expandvars(r"%PROGRAMFILES%\Claude\Claude.exe"),
                 ]:
                     if os.path.exists(path):
-                        subprocess.Popen([path], shell=False)
+                        _safe_popen([path], shell=False)
                         return CommandResult(handled=True, response="Opening Claude Desktop.")
                 return CommandResult(
                     handled=True,
@@ -237,7 +382,7 @@ def _send_to_claude(task: str, folder: str = "") -> CommandResult:
         cwd = folder if folder else os.path.expanduser("~")
         cmd = ["claude", "-p", task]
         logger.info("Sending to Claude Code: %s", task[:80])
-        proc = subprocess.Popen(
+        proc = _safe_popen(
             cmd,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
@@ -263,31 +408,66 @@ def _send_to_claude(task: str, folder: str = "") -> CommandResult:
 
 def _handle_system_command(cmd_text: str) -> CommandResult:
     """Handle system commands like lock screen, volume, etc."""
+    # ── Recycle Bin specific actions ─────────────────────────────────────
+    if ("empty" in cmd_text or "clear" in cmd_text) and (
+        "recycle" in cmd_text or "recycling" in cmd_text or "trash" in cmd_text or "bin" in cmd_text
+    ):
+        try:
+            # PowerShell Clear-RecycleBin -Force is the cleanest way
+            _safe_popen(
+                ['powershell', '-NoProfile', '-Command', 'Clear-RecycleBin -Force -ErrorAction SilentlyContinue'],
+                shell=False,
+                creationflags=subprocess.CREATE_NO_WINDOW if hasattr(subprocess, 'CREATE_NO_WINDOW') else 0,
+            )
+            return CommandResult(handled=True, response="Recycle Bin emptied, Sir.")
+        except Exception as exc:
+            logger.error("Clear-RecycleBin failed: %s", exc)
+            return CommandResult(handled=True, success=False,
+                                 response="I couldn't empty the Recycle Bin, Sir.")
+
     if "lock" in cmd_text and ("screen" in cmd_text or "computer" in cmd_text):
-        subprocess.Popen("rundll32.exe user32.dll,LockWorkStation", shell=True)
+        _safe_popen("rundll32.exe user32.dll,LockWorkStation", shell=True)
         return CommandResult(handled=True, response="Locking your screen.")
 
+    if ("sleep" in cmd_text and ("computer" in cmd_text or "laptop" in cmd_text or "machine" in cmd_text or "pc" in cmd_text)) \
+            or cmd_text in ("sleep", "go to sleep", "put to sleep"):
+        # Note: this works only if hibernation is OFF.
+        _safe_popen("rundll32.exe powrprof.dll,SetSuspendState 0,1,0", shell=True)
+        return CommandResult(handled=True, response="Sleeping, Sir.")
+
+    if cmd_text in ("restart", "reboot", "restart the computer", "reboot the computer"):
+        _safe_popen("shutdown /r /t 5", shell=True)
+        return CommandResult(handled=True, response="Restarting in five seconds, Sir.")
+
+    if cmd_text in ("shut down", "shutdown", "shut down the computer", "power off"):
+        _safe_popen("shutdown /s /t 10", shell=True)
+        return CommandResult(handled=True, response="Shutting down in ten seconds. Say cancel to abort.")
+
+    if cmd_text in ("cancel shutdown", "abort shutdown", "cancel"):
+        _safe_popen("shutdown /a", shell=True)
+        return CommandResult(handled=True, response="Shutdown cancelled, Sir.")
+
     if "screenshot" in cmd_text or "screen shot" in cmd_text:
-        subprocess.Popen("snippingtool", shell=True)
+        _safe_popen("snippingtool", shell=True)
         return CommandResult(handled=True, response="Opening the snipping tool.")
 
     if "volume up" in cmd_text or "turn up" in cmd_text:
         # Use PowerShell to increase volume
-        subprocess.Popen(
+        _safe_popen(
             'powershell -Command "(New-Object -ComObject WScript.Shell).SendKeys([char]175)"',
             shell=True,
         )
         return CommandResult(handled=True, response="Volume up.")
 
     if "volume down" in cmd_text or "turn down" in cmd_text:
-        subprocess.Popen(
+        _safe_popen(
             'powershell -Command "(New-Object -ComObject WScript.Shell).SendKeys([char]174)"',
             shell=True,
         )
         return CommandResult(handled=True, response="Volume down.")
 
     if "mute" in cmd_text:
-        subprocess.Popen(
+        _safe_popen(
             'powershell -Command "(New-Object -ComObject WScript.Shell).SendKeys([char]173)"',
             shell=True,
         )
@@ -319,10 +499,28 @@ def route_command(raw_text: str) -> CommandResult:
     if not text:
         return CommandResult(handled=False, response="")
 
+    # ── Pattern: "open X and Y" / "open X then Y" — multi-app launch ─────
+    multi_match = re.match(r"^open\s+(.+)$", text)
+    if multi_match and re.search(r"\s+(?:and|then|and then)\s+", multi_match.group(1)):
+        targets = re.split(r"\s+(?:and|then|and then)\s+", multi_match.group(1))
+        opened = []
+        for t in targets:
+            t = t.strip().rstrip(".")
+            if not t:
+                continue
+            r = _open_app(t)
+            if not r.handled:
+                r = _open_website(t)
+            if r.handled and r.success:
+                opened.append(t.title())
+        if opened:
+            joined = ", ".join(opened[:-1]) + (f", and {opened[-1]}" if len(opened) > 1 else opened[0])
+            return CommandResult(handled=True, response=f"Opening {joined}.")
+
     # ── Pattern: "open <app/website>" ─────────────────────────────────────
-    open_match = re.match(r"^open\s+(.+)$", text)
+    open_match = re.match(r"^open\s+(?:the\s+)?(.+)$", text)
     if open_match:
-        target = open_match.group(1).strip()
+        target = open_match.group(1).strip().rstrip(".")
 
         # Check apps first
         result = _open_app(target)

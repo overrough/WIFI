@@ -11,7 +11,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from core.config import get_settings
-from routers import chat, memory, tasks
+from routers import chat, memory, notifications as notifications_router, tasks
 
 logging.basicConfig(
     level=logging.INFO,
@@ -34,6 +34,7 @@ async def lifespan(app: FastAPI):
         import models.memory        # noqa: F401
         import models.task          # noqa: F401
         import models.tool_log      # noqa: F401
+        import models.notification  # noqa: F401
         async with engine.begin() as conn:
             await conn.run_sync(Base.metadata.create_all)
         logger.info("Database tables ready.")
@@ -71,9 +72,21 @@ async def lifespan(app: FastAPI):
     except Exception as exc:
         logger.warning("Could not pre-load embedder: %s", exc)
 
+    # Start JARVIS proactive routines (task nudger, calendar watcher, etc.)
+    try:
+        from jarvis_core.routines import start_scheduler
+        start_scheduler()
+    except Exception as exc:
+        logger.warning("Could not start routines scheduler: %s", exc)
+
     yield
 
     logger.info("Jarvis shutting down.")
+    try:
+        from jarvis_core.routines import stop_scheduler
+        stop_scheduler()
+    except Exception:
+        pass
 
 
 app = FastAPI(
@@ -117,6 +130,7 @@ async def global_exception_handler(request: Request, exc: Exception):
 app.include_router(chat.router)
 app.include_router(memory.router)
 app.include_router(tasks.router)
+app.include_router(notifications_router.router)
 
 
 @app.get("/health")
