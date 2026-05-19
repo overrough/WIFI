@@ -23,7 +23,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from agents.jarvis_agent import get_agent
 from core.database import get_db
 from models.conversation import Conversation, Message
-from models.user import User
+from models.user import User, UserProfile
 from routers.auth import get_current_user
 
 logger = logging.getLogger(__name__)
@@ -110,6 +110,15 @@ async def send_message(
     history_rows = list(reversed(history_result.scalars().all()))
     history = [{"role": m.role, "content": m.content} for m in history_rows]
 
+    # Resolve user name before commit — profile is lazy-loaded and can't be
+    # accessed inside an async generator after the session expires on commit.
+    _name = await db.execute(
+        select(UserProfile.value)
+        .where(UserProfile.user_id == user.id, UserProfile.key == "name")
+        .limit(1)
+    )
+    user_name = _name.scalar_one_or_none() or "Boss"
+
     # Save the user message
     user_msg = Message(
         conversation_id=conv.id,
@@ -127,7 +136,7 @@ async def send_message(
             async for chunk in agent.stream_chat(
                 query=body.content,
                 user_id=str(user.id),
-                user_name=user.profile_dict().get("name", "Boss"),
+                user_name=user_name,
                 mode=conv.mode,
                 history=history,
             ):

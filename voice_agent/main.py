@@ -1,5 +1,7 @@
 """
-Jarvis Voice Agent — fully local, completely free pipeline.
+FRIDAY Voice Agent — fully local, completely free pipeline.
+(Persona originally named JARVIS — paths, env vars, and module names
+intentionally still say jarvis to avoid breaking existing config.)
 
 Flow:
   Mic ──► Wake word / Double clap
@@ -11,7 +13,7 @@ Flow:
          faster-whisper (STT, local)
               │
               ▼
-         Jarvis backend API (streaming)
+         Friday backend API (streaming)
               │
               ▼
          edge-tts (TTS, free)  ──► Speaker
@@ -26,7 +28,7 @@ Setup:
   pip install -r requirements.txt
   python main.py
 
-Then say "Jarvis" or double-clap to activate.
+Then say 'Jarvis' or 'Friday' or double-clap to activate.
 """
 
 import asyncio
@@ -41,6 +43,21 @@ from typing import Optional
 import numpy as np
 from dotenv import load_dotenv
 from pathlib import Path
+
+# ── Unbuffered stdout/stderr ─────────────────────────────────────────────────
+# The launch_jarvis.vbs script redirects pythonw's stdout/stderr to
+# logs\voice_agent.log. By default Python block-buffers stdout when it's
+# not a tty, which means crashes and live logs only flush every ~8 KB.
+# That made debugging the May 14 wake-word bug impossible — the log
+# stopped at the last flush boundary even though the process was still
+# alive. Force line buffering so every log line hits disk immediately.
+try:
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(line_buffering=True)
+    if hasattr(sys.stderr, "reconfigure"):
+        sys.stderr.reconfigure(line_buffering=True)
+except Exception:
+    pass
 
 # Load backend .env so voice agent shares the same config
 _backend_env = Path(__file__).parent.parent / "backend" / ".env"
@@ -66,6 +83,11 @@ ELEVENLABS_VOICE_ID = os.getenv("ELEVENLABS_VOICE_ID", "")
 WAKE_WORD_SENSITIVITY = float(os.getenv("WAKE_WORD_SENSITIVITY", "0.5"))
 CLAP_RMS_THRESHOLD = float(os.getenv("CLAP_RMS_THRESHOLD", "0.45"))
 
+# When set (the autostart launcher sets this), Friday will speak the
+# morning briefing on its own as soon as it boots — no need for Sir to
+# say "Friday, brief me". The HUD pops to LISTENING after.
+FRIDAY_AUTOBOOT = os.getenv("FRIDAY_AUTOBOOT", "").lower() in ("1", "true", "yes", "on")
+
 # Recording settings
 SAMPLE_RATE = 16000
 SILENCE_THRESHOLD = 0.02      # RMS below this = silence
@@ -75,8 +97,11 @@ MAX_RECORD_S = 30             # hard cap on recording length
 # ─── Session state ────────────────────────────────────────────────────────────
 
 _conversation_id: Optional[str] = None
-_is_speaking = False          # TTS guard — don't activate while Jarvis is talking
+_is_speaking = False          # TTS guard — don't activate while Friday is talking
 _hud = None                   # JarvisHUD instance (set by main() if PyQt6 available)
+_listener = None              # ActivationListener instance (set by main()) — also
+                              # serves as the recorder's audio source so we don't
+                              # open two simultaneous mic streams (silent-record bug).
 
 
 # ─── Backend API ──────────────────────────────────────────────────────────────
@@ -132,6 +157,68 @@ async def call_jarvis(conversation_id: str, user_message: str) -> str:
     return "".join(parts)
 
 
+async def _autoboot_greeting() -> None:
+    """First-boot proactive briefing.
+
+    Called once at startup when ``FRIDAY_AUTOBOOT`` is set. We wait a
+    moment for the backend to finish warming up, fetch the briefing
+    (force_brief=True so we get one even if /pending wouldn't normally
+    deliver), and speak it. If the backend isn't ready or has nothing,
+    we fall back to a time-of-day greeting so Sir always hears Friday
+    confirm she's online.
+    """
+    global _is_speaking
+    try:
+        # Wait for backend to come up. The launcher gives 12 s; we
+        # poll for another 10 s in case it's slow.
+        for attempt in range(20):
+            try:
+                import httpx
+                async with httpx.AsyncClient(timeout=2) as client:
+                    r = await client.get(f"{BACKEND_URL}/health")
+                    if r.status_code == 200:
+                        break
+            except Exception:
+                pass
+            await asyncio.sleep(0.5)
+
+        proactive = await fetch_pending(force_brief=True)
+        text = proactive.get("briefing") if isinstance(proactive, dict) else None
+        if not text:
+            from datetime import datetime
+            hour = datetime.now().hour
+            if hour < 5:
+                lead = "Up late again, Sir"
+            elif hour < 12:
+                lead = "Good morning, Sir"
+            elif hour < 17:
+                lead = "Good afternoon, Sir"
+            else:
+                lead = "Good evening, Sir"
+            text = f"{lead}. Friday is online and the deck is clear."
+
+        logger.info("Autoboot greeting: %s", text[:120])
+        _hud_state("speaking", text)
+        _is_speaking = True
+        try:
+            from tts_engine import speak
+            await speak(
+                text, provider=TTS_PROVIDER, voice=EDGE_TTS_VOICE,
+                elevenlabs_api_key=ELEVENLABS_API_KEY,
+                elevenlabs_voice_id=ELEVENLABS_VOICE_ID,
+            )
+        finally:
+            _is_speaking = False
+            _hud_state("idle")
+        try:
+            from safety import audit
+            audit("speak_briefing", result="ok", text=text[:200])
+        except Exception:
+            pass
+    except Exception as exc:
+        logger.warning("Autoboot greeting failed: %s", exc)
+
+
 async def fetch_pending(force_brief: bool = False) -> dict:
     """
     Ask the backend if it has anything proactive to say:
@@ -160,32 +247,49 @@ MIN_SPEECH_RMS = 0.03
 MIN_SPEECH_RATIO = 0.15
 
 
-def record_until_silence(on_chunk=None) -> np.ndarray:
+# Listener-fed recorder uses 80 ms chunks (the listener's native frame size).
+# That changes the maths slightly vs. the old 100 ms scheme:
+_RECORDER_CHUNK_S = 0.08
+
+
+def record_until_silence(listener, on_chunk=None) -> np.ndarray:
     """
     Record microphone audio until the user stops speaking.
+
+    Pulls audio chunks from `listener._record_queue` instead of opening
+    its own sd.InputStream — two simultaneous streams on the same mic
+    caused silent (rms=0) recordings on Windows WASAPI shared mode.
+
     Returns float32 numpy array at SAMPLE_RATE, or empty array if no speech.
-    on_chunk(rms: float) is called for each 100 ms chunk if provided.
+    on_chunk(rms: float) is called for each ~80 ms chunk if provided.
     """
-    try:
-        import sounddevice as sd
-    except ImportError:
-        raise RuntimeError("sounddevice not installed. Run: pip install sounddevice")
+    if listener is None:
+        # Defensive fallback: no listener was wired up. We deliberately
+        # do NOT open a second sd.InputStream here (that's what caused
+        # the silent-record bug); instead, refuse cleanly.
+        logger.error("record_until_silence called with no listener — cannot record.")
+        return np.array([], dtype=np.float32)
 
     logger.info("Recording... (speak now)")
-    frames = []
+    frames: list[np.ndarray] = []
     silent_chunks = 0
     speech_chunks = 0
-    chunk_size = int(SAMPLE_RATE * 0.1)
-    chunks_for_silence = int(SILENCE_DURATION_S / 0.1)
-    max_chunks = int(MAX_RECORD_S / 0.1)
+    chunks_for_silence = int(SILENCE_DURATION_S / _RECORDER_CHUNK_S)
+    max_chunks = int(MAX_RECORD_S / _RECORDER_CHUNK_S)
 
-    with sd.InputStream(samplerate=SAMPLE_RATE, channels=1, dtype="float32",
-                        blocksize=chunk_size) as stream:
+    listener.start_recording()
+    try:
         while len(frames) < max_chunks:
-            chunk, _ = stream.read(chunk_size)
-            mono = chunk[:, 0]
-            frames.append(mono.copy())
-            rms = float(np.sqrt(np.mean(mono ** 2)))
+            chunk = listener.read_chunk(timeout=1.0)
+            if chunk is None:
+                # Timed out waiting for audio — unusual; treat as silence.
+                silent_chunks += 1
+                if silent_chunks >= chunks_for_silence and len(frames) > 5:
+                    break
+                continue
+
+            frames.append(chunk.astype(np.float32, copy=False))
+            rms = float(np.sqrt(np.mean(chunk.astype(np.float32) ** 2)))
 
             if on_chunk:
                 on_chunk(rms)
@@ -197,6 +301,8 @@ def record_until_silence(on_chunk=None) -> np.ndarray:
             else:
                 silent_chunks = 0
                 speech_chunks += 1
+    finally:
+        listener.stop_recording()
 
     if not frames:
         return np.array([], dtype=np.float32)
@@ -240,7 +346,7 @@ async def handle_activation(source: str) -> None:
 
     logger.info("Activated via %s", source)
     if _is_speaking:
-        logger.debug("Ignoring activation — Jarvis is speaking.")
+        logger.debug("Ignoring activation — Friday is speaking.")
         return
 
     try:
@@ -260,7 +366,7 @@ async def handle_activation(source: str) -> None:
 
         if opener_text:
             logger.info("Proactive opener: %s", opener_text[:100])
-            print(f"\nJarvis: {opener_text}\n")
+            print(f"\nFriday: {opener_text}\n")
             _hud_state("speaking", opener_text)
             _is_speaking = True
             try:
@@ -289,7 +395,7 @@ async def handle_activation(source: str) -> None:
 
         loop = asyncio.get_event_loop()
         audio = await loop.run_in_executor(
-            None, lambda: record_until_silence(on_chunk=on_chunk)
+            None, lambda: record_until_silence(_listener, on_chunk=on_chunk)
         )
 
         if audio.size == 0:
@@ -319,9 +425,9 @@ async def handle_activation(source: str) -> None:
         if cmd_result.handled:
             response = cmd_result.response
             logger.info("Local command: %r → %r", text, response)
-            print(f"Jarvis: {response}\n")
+            print(f"Friday: {response}\n")
         else:
-            # Fall through to Jarvis backend
+            # Fall through to Friday backend
             try:
                 if _conversation_id is None:
                     _conversation_id = await start_session()
@@ -334,8 +440,8 @@ async def handle_activation(source: str) -> None:
                 response = "Sorry, the backend is unavailable right now."
                 _conversation_id = None
 
-            logger.info("Jarvis: %r", response)
-            print(f"Jarvis: {response}\n")
+            logger.info("Friday: %r", response)
+            print(f"Friday: {response}\n")
 
         # Speaking state with response text visible on HUD
         _hud_state("speaking", response)
@@ -365,7 +471,7 @@ async def _handle_typed_command(text: str) -> None:
     """
     global _conversation_id, _is_speaking
     if _is_speaking:
-        logger.debug("Ignoring typed command — Jarvis is speaking.")
+        logger.debug("Ignoring typed command — Friday is speaking.")
         return
 
     text = (text or "").strip()
@@ -399,7 +505,7 @@ async def _handle_typed_command(text: str) -> None:
             response = "Sorry, the backend is unavailable right now."
             _conversation_id = None
 
-    print(f"Jarvis: {response}\n")
+    print(f"Friday: {response}\n")
     _hud_state("speaking", response)
     _is_speaking = True
     try:
@@ -455,18 +561,49 @@ def _ensure_single_instance() -> bool:
     Uses a Windows named mutex (cross-process). Returns True if we're the
     only instance; False if another JARVIS is already running — in which
     case the caller should exit cleanly so we don't speak in stereo.
+
+    NOTE on the May 14 bug: the previous version called
+        kernel32 = ctypes.windll.kernel32
+        ...CreateMutexW(...)
+        last_error = ctypes.GetLastError()
+    which silently always returned 0. Reason: `ctypes.windll.*` wraps
+    every call with save/restore of Windows GetLastError UNLESS the DLL
+    was opened with `use_last_error=True`. So by the time we asked for
+    the error, ctypes had already restored it to the pre-call value (0)
+    and the duplicate-detection branch was unreachable. The fix is to
+    open kernel32 explicitly with `use_last_error=True` and read the
+    cached value via `ctypes.get_last_error()`.
+
+    Without this fix, every relaunch of `launch_jarvis.vbs` (or a hand
+    launch) spawned ANOTHER voice agent. Two sd.InputStream instances on
+    the same mic in WASAPI shared mode end up with one of them getting
+    silence — the real cause of Sir's RMS=0.0000 recordings.
     """
     if sys.platform != "win32":
         return True
     try:
         import ctypes
         ERROR_ALREADY_EXISTS = 183
-        kernel32 = ctypes.windll.kernel32
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.CreateMutexW.argtypes = [
+            ctypes.c_void_p, ctypes.c_int, ctypes.c_wchar_p,
+        ]
+        kernel32.CreateMutexW.restype = ctypes.c_void_p
         # The handle is intentionally leaked — it's released only when
         # this Python process exits, which is exactly what we want.
         handle = kernel32.CreateMutexW(None, False, "Global\\JARVIS_VoiceAgent_Singleton")
-        last_error = ctypes.GetLastError()
+        last_error = ctypes.get_last_error()
+        if not handle:
+            logger.warning(
+                "CreateMutexW returned NULL (err=%d) — skipping singleton check.",
+                last_error,
+            )
+            return True
         if last_error == ERROR_ALREADY_EXISTS:
+            logger.warning(
+                "Another Friday voice agent is already running (mutex held). "
+                "This duplicate will exit."
+            )
             return False
         # Keep handle alive for the lifetime of the process
         global _MUTEX_HANDLE
@@ -489,13 +626,13 @@ def _run_asyncio_loop(loop: asyncio.AbstractEventLoop) -> None:
 
 
 def main() -> None:
-    global _hud
+    global _hud, _listener
 
     # ── Single-instance guard ───────────────────────────────────────────────
-    # If another JARVIS is already running, exit silently instead of
-    # speaking in stereo. Solves the "two Jarvises talking at once" issue.
+    # If another Friday is already running, exit silently instead of
+    # speaking in stereo. Solves the "two voices talking at once" issue.
     if not _ensure_single_instance():
-        print("JARVIS is already running — closing this duplicate.")
+        print("Friday is already running — closing this duplicate.")
         return
 
     from wake_word import ActivationListener
@@ -541,11 +678,126 @@ def main() -> None:
     def on_activate(source: str) -> None:
         asyncio.run_coroutine_threadsafe(handle_activation(source), loop)
 
+    # ── Safety bridge ──────────────────────────────────────────────────
+    # safety.py exposes voice-confirmation primitives that any thread can
+    # call. main.py owns the mic + STT + asyncio loop, so we register
+    # callbacks here that bridge the gap: a sync caller from a worker
+    # thread (e.g. the shutdown confirmation flow in command_router) can
+    # speak a prompt and get Sir's reply transcribed back as a string.
+    def _safety_speak(text: str) -> None:
+        if not text:
+            return
+        try:
+            from tts_engine import speak
+            async def _say() -> None:
+                global _is_speaking
+                _hud_state("speaking", text)
+                _is_speaking = True
+                try:
+                    await speak(
+                        text, provider=TTS_PROVIDER, voice=EDGE_TTS_VOICE,
+                        elevenlabs_api_key=ELEVENLABS_API_KEY,
+                        elevenlabs_voice_id=ELEVENLABS_VOICE_ID,
+                    )
+                finally:
+                    _is_speaking = False
+            fut = asyncio.run_coroutine_threadsafe(_say(), loop)
+            try:
+                # Block until the TTS finishes so the recorder doesn't
+                # capture Friday's own voice when she's asking "are you
+                # sure?".
+                fut.result(timeout=15.0)
+            except Exception:
+                pass
+        except Exception as exc:
+            logger.debug("safety speak failed: %s", exc)
+
+    def _safety_confirm(prompt: str, timeout_s: float) -> str:
+        """Speak the prompt, record Sir's reply, return the transcript.
+
+        Runs in the worker thread that called ``request_confirmation``.
+        Uses the existing listener queue + the Whisper STT engine.
+        """
+        _safety_speak(prompt)
+        try:
+            _hud_state("listening")
+            audio = record_until_silence(_listener)
+            if audio.size == 0:
+                return ""
+            from stt_engine import transcribe_audio
+            text = transcribe_audio(audio, sample_rate=SAMPLE_RATE,
+                                    model_name=WHISPER_MODEL)
+            logger.info("Confirmation reply: %r", text)
+            return text or ""
+        except Exception as exc:
+            logger.debug("_safety_confirm error: %s", exc)
+            return ""
+        finally:
+            _hud_state("idle")
+
+    try:
+        import safety
+        safety.set_speak_handler(_safety_speak)
+        safety.set_confirmation_handler(_safety_confirm)
+        logger.info("Safety bridge wired (speak + voice confirm).")
+    except Exception as exc:
+        logger.debug("Safety bridge unavailable: %s", exc)
+
+    # ── Routine speak/status handlers ───────────────────────────────────────
+    # When `routines.run_routine_async("daily tasks")` fires from a voice
+    # command, the routine runs on its OWN background thread. The TTS engine
+    # is async and lives on the asyncio loop, so the routine can't await it
+    # directly. These two wrappers bridge the gap: they accept a plain
+    # string and schedule the real work on the right thread without blocking
+    # the caller. Both are no-ops on errors so a broken routine never
+    # crashes the voice agent.
+    def _routine_speak(text: str) -> None:
+        if not text:
+            return
+        try:
+            from tts_engine import speak
+
+            async def _say() -> None:
+                global _is_speaking
+                _hud_state("speaking", text)
+                _is_speaking = True
+                try:
+                    await speak(
+                        text,
+                        provider=TTS_PROVIDER,
+                        voice=EDGE_TTS_VOICE,
+                        elevenlabs_api_key=ELEVENLABS_API_KEY,
+                        elevenlabs_voice_id=ELEVENLABS_VOICE_ID,
+                    )
+                finally:
+                    _is_speaking = False
+                    _hud_state("idle")
+
+            asyncio.run_coroutine_threadsafe(_say(), loop)
+        except Exception as exc:
+            logger.debug("Routine speak failed: %s", exc)
+
+    def _routine_status(text: str) -> None:
+        # Keep the HUD's THINKING ring spinning with status text below it
+        # while a routine is mid-flight.
+        try:
+            _hud_state("thinking", text)
+        except Exception:
+            pass
+
+    try:
+        import routines
+        routines.set_speak_handler(_routine_speak)
+        routines.set_status_handler(_routine_status)
+        logger.info("Routines wired: %d available", len(routines.list_routines()))
+    except Exception as exc:
+        logger.debug("Routines unavailable: %s", exc)
+
     if qt_app is None:
         # No HUD — print the classic banner
         print("=" * 55)
-        print("  JARVIS — Local Voice Assistant")
-        print("  Say 'Jarvis' or double-clap to activate.")
+        print("  FRIDAY — Local Voice Assistant")
+        print("  Say 'Jarvis' or 'Friday', or double-clap to activate.")
         print("  Ctrl+C to quit.")
         print("=" * 55)
 
@@ -563,6 +815,9 @@ def main() -> None:
         sensitivity=WAKE_WORD_SENSITIVITY,
         rms_threshold=CLAP_RMS_THRESHOLD,
     )
+    # Expose the listener at module scope so record_until_silence can
+    # pull audio chunks from it instead of opening its own InputStream.
+    _listener = listener
 
     # ── Optional global hotkeys: Ctrl+Shift+J (voice), Ctrl+Shift+T (text) ──
     hotkey = None
@@ -593,7 +848,7 @@ def main() -> None:
     if hotkey is not None:
         hotkey.start()  # non-blocking — hooks into the global event loop
 
-    # ── Cleanup function used by all exit paths ─────────────────────────────
+    # ── Cleanup function used by all exit paths ─────────────────────────
     def _cleanup(*_):
         listener.stop()
         if hotkey is not None:
@@ -607,6 +862,78 @@ def main() -> None:
 
     # atexit — catches normal interpreter shutdown AND Windows console close
     atexit.register(_cleanup)
+
+    # ── Voice-confirmed shutdown bridge ────────────────────────────────
+    # command_router calls this after the user says "shut down" AND
+    # confirms verbally. It must: (1) stop the voice agent's own pieces,
+    # (2) kill the backend subprocess, (3) os._exit so threads stop too.
+    def _execute_full_shutdown() -> None:
+        try:
+            from safety import audit
+            audit("shutdown_friday", result="running_cleanup")
+        except Exception:
+            pass
+        # Speak the farewell before the TTS engine goes away.
+        try:
+            _safety_speak("Powering down, Sir. Good night.")
+        except Exception:
+            pass
+        try:
+            _cleanup()
+        except Exception as exc:
+            logger.debug("_cleanup raised during shutdown: %s", exc)
+        # Kill backend uvicorn process on port 8000. Best-effort — if
+        # it's not running, taskkill simply errors out and we move on.
+        if sys.platform == "win32":
+            try:
+                subprocess.run(
+                    [
+                        "powershell", "-NoProfile", "-Command",
+                        "Get-NetTCPConnection -LocalPort 8000 -State Listen -ErrorAction "
+                        "SilentlyContinue | ForEach-Object { Stop-Process -Id "
+                        "$_.OwningProcess -Force -ErrorAction SilentlyContinue }",
+                    ],
+                    capture_output=True, text=True, timeout=10,
+                    creationflags=subprocess.CREATE_NO_WINDOW,
+                )
+            except Exception as exc:
+                logger.debug("Backend kill failed: %s", exc)
+        # Final exit — use _exit so daemon threads (audio, Whisper) die too.
+        os._exit(0)
+
+    try:
+        from command_router import set_shutdown_handler
+        set_shutdown_handler(_execute_full_shutdown)
+        logger.info("Shutdown handler registered with command_router.")
+    except Exception as exc:
+        logger.warning("Could not register shutdown handler: %s", exc)
+
+    # ── Kill switch hotkey (Ctrl+Shift+End) ────────────────────────────
+    # An unconfirmed instant-stop. Bypasses the voice confirmation flow
+    # entirely — used when something has gone wrong and Sir needs Friday
+    # to STOP NOW. Audited so the post-mortem is clear.
+    try:
+        import keyboard  # type: ignore
+        def _killswitch():
+            try:
+                from safety import audit
+                audit("kill_switch_invoked", result="executing",
+                      note="Ctrl+Shift+End hotkey")
+            except Exception:
+                pass
+            logger.warning("KILL SWITCH PRESSED — stopping Friday.")
+            _execute_full_shutdown()
+        keyboard.add_hotkey("ctrl+shift+end", _killswitch)
+        logger.info("Kill switch armed: Ctrl+Shift+End")
+    except Exception as exc:
+        logger.debug("Could not register kill-switch hotkey: %s", exc)
+
+    # ── Autoboot morning greeting ───────────────────────────────────────
+    # When FRIDAY_AUTOBOOT=1 is set (the Startup-folder launcher does
+    # this), Friday speaks the briefing as soon as she's wired up.
+    # Without the flag, she stays quiet and waits for activation.
+    if FRIDAY_AUTOBOOT:
+        asyncio.run_coroutine_threadsafe(_autoboot_greeting(), loop)
 
     # Windows console close handler (X button, logoff, shutdown)
     if sys.platform == "win32":

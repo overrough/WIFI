@@ -44,5 +44,4 @@ Thumbs.db
 # Data and Database files
 backend/chroma_data/
 backend/data/
-backend/jarvis_core/
 *.log

@@ -1,7 +1,7 @@
 """
 Multi-agent architecture — Researcher, Writer, Executor, Reviewer.
 
-Spec §6: Four sub-agents under Jarvis orchestration.
+Spec §6: Four sub-agents under Friday orchestration.
 This file defines the *roles* and *system prompts* for each specialist.
 
 The Orchestrator (in agents/orchestrator.py) decides which sub-agent to
@@ -33,7 +33,7 @@ class SubAgentRole:
 RESEARCHER = SubAgentRole(
     name="researcher",
     system_prompt="""\
-You are JARVIS's Research Specialist.
+You are FRIDAY's Research Specialist.
 
 Your job: find, read, and summarise. Sir asks "what's happening with X?",
 "what are competitors doing?", "what's the state of the art on Y?" — and you
@@ -63,7 +63,7 @@ Never invent facts. If a source is paywalled or unreachable, say so.
 WRITER = SubAgentRole(
     name="writer",
     system_prompt="""\
-You are JARVIS's Writing Specialist.
+You are FRIDAY's Writing Specialist.
 
 Your job: produce text in Sir's voice — emails, LinkedIn posts, Instagram
 captions, proposals, follow-ups. Sir runs ElevateWebWorks (freelance AI
@@ -88,7 +88,7 @@ Then offer one alternative tone (more casual / more formal) if helpful.
 EXECUTOR = SubAgentRole(
     name="executor",
     system_prompt="""\
-You are JARVIS's Execution Specialist.
+You are FRIDAY's Execution Specialist.
 
 Your job: GET THINGS DONE on the local computer and the open internet.
 Files, shell, browser, screenshots, calendar, email drafts. You are the
@@ -119,7 +119,7 @@ Operating principles:
 REVIEWER = SubAgentRole(
     name="reviewer",
     system_prompt="""\
-You are JARVIS's Quality Reviewer.
+You are FRIDAY's Quality Reviewer.
 
 Your job: read what another agent (Researcher, Writer, or Executor)
 produced, and decide if it's good enough to surface to Sir, or if it
